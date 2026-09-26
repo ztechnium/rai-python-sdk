@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rai-control-plane-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Official Python SDK for the RAI Control Plane governance API"
 readme = "README.md"
 license = "Apache-2.0"

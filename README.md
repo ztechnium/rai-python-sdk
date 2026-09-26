@@ -114,14 +114,47 @@ heartbeat / health
   → observe_input
   → authorize_action   (ALLOW | DENY | REQUIRE_APPROVAL | MONITOR)
   → report_execution   (after ALLOW, when a side effect runs)
+  → authorize_data_access / record_usage   (optional)
   → observe_output
   → end_session
 ```
+
+### Metering
+
+```python
+session.record_model_call(
+    provider="openai",
+    model="gpt-4o",
+    input_tokens=120,
+    output_tokens=40,
+)
+```
+
+Helpers `usage_from_openai`, `usage_from_anthropic`, and `usage_from_gemini` extract
+token fields from common provider response shapes.
+
+### Data access
+
+```python
+session.authorize_data_access(
+    resource="customer.profile",
+    fields=["email", "ssn"],
+    purpose="support_summary",
+)
+```
+
+### Approvals
+
+When `authorize_action` returns `REQUIRE_APPROVAL`, poll with
+`client.get_approval_status(decision.approval_request_id)`.
 
 ## API compatibility
 
 This SDK targets the stable `/sdk/v1` HTTP contract (`API_RANGE = ">=1.0.0,<2.0.0"`).
 Your control-plane deployment must expose compatible `/sdk/v1` endpoints.
+
+Pass `delegation_id` on `start_session` to bind a tenant-scoped grant. Ended sessions
+are not reused unless `allow_ended_session_reuse=True`.
 
 ## Error handling
 
@@ -139,7 +172,7 @@ except RAIError as exc:
 
 ## Async client
 
-`AsyncRAIClient` is **not included in 0.1.0**. Async support is deferred to a future
+`AsyncRAIClient` is **not included in 0.2.0**. Async support is deferred to a future
 release. For asyncio applications today, run the synchronous `RAIClient` in a thread pool
 (`asyncio.to_thread`) or call the REST API directly.
 

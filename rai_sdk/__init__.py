@@ -3,14 +3,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 from uuid import uuid4
 
 import httpx
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 API_RANGE = ">=1.0.0,<2.0.0"
 _REDACTED = "***"
+
+
+class ConfigurationProvenanceMetadata(TypedDict, total=False):
+    """Optional application-reported config identifiers (not RAI-owned prompts).
+
+    Prefer these keys in ``start_session`` / ``observe_input`` / ``observe_output``
+    metadata so RAI can record which external configuration produced a turn
+    without receiving the persona / system prompt body.
+    """
+
+    configuration_id: str
+    configuration_version: str
+    configuration_digest: str
+    configuration_source: str
+    configuration_environment: str
+    deployment_id: str
+    release_id: str
+    generation_id: str
+    turn_id: str
 
 
 def _redact_secrets(text: str, secret: str) -> str:
@@ -93,6 +112,44 @@ class Decision:
         )
 
 
+def _metering_cost_body(
+    *,
+    cost: float | None,
+    provider_cost: float | None,
+    currency: str,
+    cost_source: str | None,
+) -> dict[str, Any] | None:
+    money = provider_cost if provider_cost is not None else cost
+    if money is None and not cost_source:
+        return None
+    return {
+        "amount": money,
+        "currency": currency,
+        "source": cost_source
+        or ("PROVIDER_RESPONSE" if provider_cost is not None else "EXPLICIT_COST"),
+    }
+
+
+def _metering_usage_body(
+    *,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None,
+    cache_write_tokens: int | None,
+    reasoning_tokens: int | None,
+    total_tokens: int | None,
+) -> dict[str, int]:
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+    }
+    return {key: value for key, value in usage.items() if value is not None}
+
+
 class Session:
     def __init__(self, client: "RAIClient", data: dict[str, Any]) -> None:
         self._client = client
@@ -108,7 +165,7 @@ class Session:
         content_type: str = "text",
         observed_model: str | None = None,
         principal: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: ConfigurationProvenanceMetadata | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._client._request(
             "POST",
@@ -149,11 +206,39 @@ class Session:
                 "metadata": metadata or {},
                 "approval_request_id": approval_request_id,
             },
-            headers={"Idempotency-Key": idempotency_key}
-            if idempotency_key
-            else None,
+            headers={"Idempotency-Key": idempotency_key} if idempotency_key else None,
         )
         return Decision.from_dict(data)
+
+    def authorize_data_access(
+        self,
+        *,
+        resource: str,
+        fields: list[str] | None = None,
+        payload: dict[str, Any] | list[Any] | None = None,
+        purpose: str | None = None,
+        access_mode: str = "READ",
+        data_source_id: str | None = None,
+        tool_id: str | None = None,
+        target: str | None = None,
+        row_filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Authorize / mask structured data before it reaches the model."""
+        return self._client._request(
+            "POST",
+            f"/sdk/v1/sessions/{self.rai_session_id}/data-access/authorize",
+            json={
+                "resource": resource,
+                "fields": fields or [],
+                "payload": payload,
+                "purpose": purpose,
+                "access_mode": access_mode,
+                "data_source_id": data_source_id,
+                "tool_id": tool_id,
+                "target": target,
+                "row_filter": row_filter or {},
+            },
+        )
 
     def observe_output(
         self,
@@ -161,7 +246,7 @@ class Session:
         *,
         content_type: str = "text",
         observed_model: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: ConfigurationProvenanceMetadata | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._client._request(
             "POST",
@@ -177,6 +262,151 @@ class Session:
     def end(self) -> dict[str, Any]:
         return self._client._request(
             "POST", f"/sdk/v1/sessions/{self.rai_session_id}/end"
+        )
+
+    def record_usage(
+        self,
+        *,
+        span_type: str = "MODEL_CALL",
+        provider: str | None = None,
+        model: str | None = None,
+        operation: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cost: float | None = None,
+        provider_cost: float | None = None,
+        currency: str = "USD",
+        cost_source: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        external_span_id: str | None = None,
+        parent_span_id: str | None = None,
+        trajectory_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        tokens_are_estimated: bool = False,
+    ) -> dict[str, Any]:
+        return self._client._request(
+            "POST",
+            f"/sdk/v1/sessions/{self.rai_session_id}/metering/spans",
+            json={
+                "span_type": span_type,
+                "provider": provider,
+                "model": model,
+                "operation": operation,
+                "usage": _metering_usage_body(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    total_tokens=total_tokens,
+                ),
+                "cost": _metering_cost_body(
+                    cost=cost,
+                    provider_cost=provider_cost,
+                    currency=currency,
+                    cost_source=cost_source,
+                ),
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "external_span_id": external_span_id,
+                "parent_span_id": parent_span_id,
+                "trajectory_id": trajectory_id,
+                "metadata": metadata or {},
+                "tokens_are_estimated": tokens_are_estimated,
+            },
+        )
+
+    def report_model_usage(self, **kwargs: Any) -> dict[str, Any]:
+        """Preferred alias — report tokens; VigilRAI prices them."""
+        kwargs.setdefault("span_type", "MODEL_CALL")
+        return self.record_usage(**kwargs)
+
+    def record_model_call(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs["span_type"] = "MODEL_CALL"
+        return self.record_usage(**kwargs)
+
+    def complete_metering_span(
+        self,
+        span_id: str,
+        *,
+        span_type: str = "MODEL_CALL",
+        provider: str | None = None,
+        model: str | None = None,
+        operation: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cost: float | None = None,
+        provider_cost: float | None = None,
+        currency: str = "USD",
+        cost_source: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        external_span_id: str | None = None,
+        parent_span_id: str | None = None,
+        trajectory_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        tokens_are_estimated: bool = False,
+    ) -> dict[str, Any]:
+        return self._client._request(
+            "PATCH",
+            f"/sdk/v1/sessions/{self.rai_session_id}/metering/spans/{span_id}",
+            json={
+                "span_type": span_type,
+                "provider": provider,
+                "model": model,
+                "operation": operation,
+                "usage": _metering_usage_body(
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    total_tokens=total_tokens,
+                ),
+                "cost": _metering_cost_body(
+                    cost=cost,
+                    provider_cost=provider_cost,
+                    currency=currency,
+                    cost_source=cost_source,
+                ),
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "external_span_id": external_span_id,
+                "parent_span_id": parent_span_id,
+                "trajectory_id": trajectory_id,
+                "metadata": metadata or {},
+                "tokens_are_estimated": tokens_are_estimated,
+            },
+        )
+
+    def report_execution(
+        self,
+        decision_id: str,
+        *,
+        status: str,
+        external_execution_id: str | None = None,
+        result_metadata: dict[str, Any] | None = None,
+        error_metadata: dict[str, Any] | None = None,
+        usage: dict[str, Any] | None = None,
+        cost: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._client.report_execution(
+            decision_id,
+            status=status,
+            external_execution_id=external_execution_id,
+            result_metadata=result_metadata,
+            error_metadata=error_metadata,
+            usage=usage,
+            cost=cost,
         )
 
 
@@ -228,7 +458,9 @@ class RAIClient:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/sdk/v1/health", auth=False)
 
-    def heartbeat(self, capability_matrix: dict[str, bool] | None = None) -> dict[str, Any]:
+    def heartbeat(
+        self, capability_matrix: dict[str, bool] | None = None
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             "/sdk/v1/heartbeat",
@@ -247,8 +479,16 @@ class RAIClient:
         external_conversation_id: str | None = None,
         principal: str | None = None,
         channel: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: ConfigurationProvenanceMetadata | dict[str, Any] | None = None,
+        delegation_id: str | None = None,
+        allow_ended_session_reuse: bool = False,
     ) -> Session:
+        """Start a governed SDK session.
+
+        Pass ConfigurationProvenanceMetadata keys in ``metadata``
+        (configuration_id / version / digest, deployment_id, release_id)
+        so RAI records external config provenance without owning prompts.
+        """
         data = self._request(
             "POST",
             "/sdk/v1/sessions",
@@ -258,6 +498,8 @@ class RAIClient:
                 "external_conversation_id": external_conversation_id,
                 "principal": principal,
                 "channel": channel,
+                "delegation_id": delegation_id,
+                "allow_ended_session_reuse": allow_ended_session_reuse,
                 "metadata": metadata or {},
             },
         )
@@ -291,6 +533,9 @@ class RAIClient:
         return Decision.from_dict(
             self._request("GET", f"/sdk/v1/decisions/{decision_id}")
         )
+
+    def get_approval_status(self, approval_request_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/sdk/v1/approvals/{approval_request_id}")
 
     def _request(
         self,
@@ -336,3 +581,64 @@ class RAIClient:
         if resp.status_code == 204 or not resp.content:
             return {}
         return resp.json()
+
+
+def usage_from_openai(response: Any) -> dict[str, Any]:
+    usage = getattr(response, "usage", None) or (
+        response.get("usage") if isinstance(response, dict) else {}
+    )
+    usage = usage or {}
+    if not isinstance(usage, dict):
+        usage = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "prompt_tokens_details": getattr(usage, "prompt_tokens_details", None),
+            "completion_tokens_details": getattr(
+                usage, "completion_tokens_details", None
+            ),
+        }
+    details = usage.get("prompt_tokens_details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    out_details = usage.get("completion_tokens_details") or {}
+    if not isinstance(out_details, dict):
+        out_details = {}
+    return {
+        "provider": "openai",
+        "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+        "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+        "cached_input_tokens": details.get("cached_tokens")
+        or usage.get("cached_tokens"),
+        "reasoning_tokens": out_details.get("reasoning_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+def usage_from_anthropic(response: Any) -> dict[str, Any]:
+    usage = getattr(response, "usage", None) or (
+        response.get("usage") if isinstance(response, dict) else {}
+    )
+    usage = usage if isinstance(usage, dict) else {}
+    return {
+        "provider": "anthropic",
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_input_tokens": usage.get("cache_read_input_tokens"),
+        "cache_write_tokens": usage.get("cache_creation_input_tokens"),
+    }
+
+
+def usage_from_gemini(response: Any) -> dict[str, Any]:
+    meta = getattr(response, "usage_metadata", None) or (
+        response.get("usage_metadata") if isinstance(response, dict) else {}
+    )
+    meta = meta if isinstance(meta, dict) else {}
+    return {
+        "provider": "google",
+        "input_tokens": meta.get("prompt_token_count") or meta.get("input_tokens"),
+        "output_tokens": meta.get("candidates_token_count")
+        or meta.get("output_tokens"),
+        "cached_input_tokens": meta.get("cached_content_token_count"),
+        "total_tokens": meta.get("total_token_count"),
+    }

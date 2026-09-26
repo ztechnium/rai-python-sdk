@@ -206,3 +206,99 @@ def test_report_execution_via_client(client_factory):
     assert seen["status"] == "FAILED"
     assert seen["error_metadata"] == {"code": "TIMEOUT"}
     client.close()
+
+
+def test_start_session_delegation_flags(client_factory):
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sdk/v1/sessions":
+            seen.update(json.loads(request.content))
+            return json_response(201, {"rai_session_id": SESSION_ID})
+        return json_response(404, {"detail": {"error": "NOT_FOUND"}})
+
+    client = client_factory(httpx.MockTransport(handler))
+    client.start_session(
+        delegation_id="del-1",
+        allow_ended_session_reuse=True,
+    )
+    assert seen["delegation_id"] == "del-1"
+    assert seen["allow_ended_session_reuse"] is True
+    client.close()
+
+
+def test_record_usage_and_complete_span(client_factory):
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/sdk/v1/sessions":
+            return json_response(201, {"rai_session_id": SESSION_ID})
+        if request.url.path.endswith("/metering/spans"):
+            return json_response(200, {"span_id": "span-1"})
+        if "/metering/spans/span-1" in request.url.path:
+            return json_response(200, {"completed": True})
+        return json_response(404, {"detail": {"error": "NOT_FOUND"}})
+
+    client = client_factory(httpx.MockTransport(handler))
+    session = client.start_session()
+    session.record_model_call(
+        provider="openai",
+        model="gpt-4o",
+        input_tokens=10,
+        output_tokens=5,
+        provider_cost=0.01,
+    )
+    session.complete_metering_span("span-1", output_tokens=8)
+    assert calls[1][0] == "POST"
+    assert calls[1][2]["usage"]["input_tokens"] == 10
+    assert calls[1][2]["cost"]["source"] == "PROVIDER_RESPONSE"
+    assert calls[2][0] == "PATCH"
+    client.close()
+
+
+def test_authorize_data_access(client_factory):
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sdk/v1/sessions":
+            return json_response(201, {"rai_session_id": SESSION_ID})
+        if request.url.path.endswith("/data-access/authorize"):
+            seen.update(json.loads(request.content))
+            return json_response(200, {"decision": "ALLOW"})
+        return json_response(404, {"detail": {"error": "NOT_FOUND"}})
+
+    client = client_factory(httpx.MockTransport(handler))
+    session = client.start_session()
+    result = session.authorize_data_access(
+        resource="customer.profile",
+        fields=["email"],
+    )
+    assert result["decision"] == "ALLOW"
+    assert seen["resource"] == "customer.profile"
+    assert seen["access_mode"] == "READ"
+    client.close()
+
+
+def test_get_decision_and_approval_status(client_factory):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sdk/v1/decisions/dec-1":
+            return json_response(
+                200,
+                {
+                    "decision": "REQUIRE_APPROVAL",
+                    "decision_id": "dec-1",
+                    "approval": {"approval_request_id": "apr-1"},
+                },
+            )
+        if request.url.path == "/sdk/v1/approvals/apr-1":
+            return json_response(200, {"status": "PENDING"})
+        return json_response(404, {"detail": {"error": "NOT_FOUND"}})
+
+    client = client_factory(httpx.MockTransport(handler))
+    decision = client.get_decision("dec-1")
+    assert decision.decision == "REQUIRE_APPROVAL"
+    assert decision.approval_request_id == "apr-1"
+    assert client.get_approval_status("apr-1")["status"] == "PENDING"
+    client.close()
