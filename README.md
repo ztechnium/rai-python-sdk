@@ -153,7 +153,7 @@ When `authorize_action` returns `REQUIRE_APPROVAL`, poll with
 This SDK targets the stable `/sdk/v1` HTTP contract (`API_RANGE = ">=1.0.0,<2.0.0"`).
 Your control-plane deployment must expose compatible `/sdk/v1` endpoints.
 
-Pass `delegation_id` on `start_session` to bind a tenant-scoped grant. Ended sessions
+Pass `delegation_id` on `start_session` to bind a grant for this instance. Ended sessions
 are not reused unless `allow_ended_session_reuse=True`.
 
 ## Error handling
